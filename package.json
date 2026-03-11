@@ -23,7 +23,8 @@
     "test:run": "vitest run",
     "test:preview-sync": "vitest run src/features/preview/components/video-preview.sync.test.tsx",
     "test:preview-sync:stress": "node scripts/preview-sync-stress.mjs --runs 20",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "prepare": "husky"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",
@@ -79,10 +80,12 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^4.3.4",
     "@vitest/coverage-v8": "^4.0.17",
+    "@webgpu/types": "^0.1.69",
     "eslint": "^9.18.0",
     "eslint-plugin-react-hooks": "^6.0.0",
     "eslint-plugin-react-refresh": "^0.4.16",
     "globals": "^15.14.0",
+    "husky": "^9.1.7",
     "jsdom": "^27.4.0",
     "tailwindcss": "^4.1.17",
     "typescript": "~5.9.3",

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, memo, useCallback, useMemo } from 'react';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { TimelineHeader } from './timeline-header';
 import { TimelineContent } from './timeline-content';
+import { TimelineNavigator } from './timeline-navigator';
 import { TrackHeader } from './track-header';
 import { KeyframeGraphPanel } from './keyframe-graph-panel';
 import { useTimelineTracks } from '../hooks/use-timeline-tracks';
@@ -27,6 +28,8 @@ interface TimelineProps {
   /** Callback when graph panel open state changes - used by parent to resize panel */
   onGraphPanelOpenChange?: (isOpen: boolean) => void;
 }
+
+type TimelineEditorTab = 'keyframes' | 'scopes';
 
 /**
  * Complete Timeline Component
@@ -95,32 +98,55 @@ export const Timeline = memo(function Timeline({ duration, onGraphPanelOpenChang
     handleZoomOut: () => void;
     handleZoomToFit: () => void;
   } | null>(null);
+  const [timelineMetrics, setTimelineMetrics] = useState({
+    actualDuration: Math.max(duration, 10),
+    timelineWidth: 0,
+  });
 
-  // Keyframe graph panel state
-  const [isGraphPanelOpen, setIsGraphPanelOpen] = useState(false);
+  // Bottom editor panel state (Keyframes / Scopes)
+  const [isEditorPanelOpen, setIsEditorPanelOpen] = useState(false);
+  const [activeEditorTab, setActiveEditorTab] = useState<TimelineEditorTab>('keyframes');
 
-  const handleToggleGraphPanel = useCallback(() => {
-    setIsGraphPanelOpen((prev) => {
-      const newValue = !prev;
-      onGraphPanelOpenChange?.(newValue);
-      return newValue;
-    });
-  }, [onGraphPanelOpenChange]);
+  const setEditorPanelOpen = useCallback(
+    (nextOpen: boolean) => {
+      setIsEditorPanelOpen((prevOpen) => {
+        if (prevOpen === nextOpen) return prevOpen;
+        onGraphPanelOpenChange?.(nextOpen);
+        return nextOpen;
+      });
+    },
+    [onGraphPanelOpenChange]
+  );
 
-  const handleCloseGraphPanel = useCallback(() => {
-    setIsGraphPanelOpen(false);
-    onGraphPanelOpenChange?.(false);
-  }, [onGraphPanelOpenChange]);
+  const handleToggleKeyframeTab = useCallback(() => {
+    const shouldClose = isEditorPanelOpen && activeEditorTab === 'keyframes';
+    setActiveEditorTab('keyframes');
+    setEditorPanelOpen(!shouldClose);
+  }, [isEditorPanelOpen, activeEditorTab, setEditorPanelOpen]);
+
+  const handleToggleScopesTab = useCallback(() => {
+    const shouldClose = isEditorPanelOpen && activeEditorTab === 'scopes';
+    setActiveEditorTab('scopes');
+    setEditorPanelOpen(!shouldClose);
+  }, [isEditorPanelOpen, activeEditorTab, setEditorPanelOpen]);
+
+  const handleToggleEditorPanel = useCallback(() => {
+    setEditorPanelOpen(!isEditorPanelOpen);
+  }, [isEditorPanelOpen, setEditorPanelOpen]);
+
+  const handleCloseEditorPanel = useCallback(() => {
+    setEditorPanelOpen(false);
+  }, [setEditorPanelOpen]);
 
   // Keyboard shortcut: Ctrl/Cmd+K to toggle keyframe editor
   useHotkeys(
     HOTKEYS.TOGGLE_KEYFRAME_EDITOR,
     (event) => {
       event.preventDefault();
-      handleToggleGraphPanel();
+      handleToggleKeyframeTab();
     },
     HOTKEY_OPTIONS,
-    [handleToggleGraphPanel]
+    [handleToggleKeyframeTab]
   );
 
   // Keyboard shortcut: Ctrl/Cmd+G to group selected tracks
@@ -468,8 +494,10 @@ export const Timeline = memo(function Timeline({ duration, onGraphPanelOpenChang
           onZoomIn={zoomHandlers?.handleZoomIn}
           onZoomOut={zoomHandlers?.handleZoomOut}
           onZoomToFit={zoomHandlers?.handleZoomToFit}
-          isGraphPanelOpen={isGraphPanelOpen}
-          onToggleGraphPanel={handleToggleGraphPanel}
+          isKeyframePanelOpen={isEditorPanelOpen && activeEditorTab === 'keyframes'}
+          onToggleKeyframePanel={handleToggleKeyframeTab}
+          isScopesPanelOpen={isEditorPanelOpen && activeEditorTab === 'scopes'}
+          onToggleScopesPanel={handleToggleScopesTab}
         />
 
         {/* Composition Breadcrumbs - shown when inside a sub-composition */}
@@ -589,14 +617,28 @@ export const Timeline = memo(function Timeline({ duration, onGraphPanelOpenChang
           duration={duration}
           scrollRef={timelineContentRef}
           onZoomHandlersReady={setZoomHandlers}
+          onMetricsChange={setTimelineMetrics}
         />
+      </div>
+
+      <div className="flex flex-shrink-0 overflow-hidden">
+        <div className="w-48 border-r border-border panel-bg flex-shrink-0" />
+        <div className="flex-1 min-w-0">
+          <TimelineNavigator
+            actualDuration={timelineMetrics.actualDuration}
+            timelineWidth={timelineMetrics.timelineWidth}
+            scrollContainerRef={timelineContentRef}
+          />
+        </div>
       </div>
 
       {/* Keyframe Graph Panel */}
       <KeyframeGraphPanel
-        isOpen={isGraphPanelOpen}
-        onToggle={handleToggleGraphPanel}
-        onClose={handleCloseGraphPanel}
+        isOpen={isEditorPanelOpen}
+        activeTab={activeEditorTab}
+        onSelectTab={setActiveEditorTab}
+        onToggle={handleToggleEditorPanel}
+        onClose={handleCloseEditorPanel}
       />
     </div>
 

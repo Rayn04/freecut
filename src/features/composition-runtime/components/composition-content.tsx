@@ -1,6 +1,6 @@
 ﻿import React, { useMemo, useCallback } from 'react';
 import { AbsoluteFill, Sequence, useSequenceContext } from '@/features/composition-runtime/deps/player';
-import type { CompositionItem as CompositionItemType, TimelineItem } from '@/types/timeline';
+import type { CompositionItem as CompositionItemType, TimelineItem, ShapeItem } from '@/types/timeline';
 import type { ResolvedTransform } from '@/types/transform';
 import { useCompositionsStore } from '@/features/composition-runtime/deps/stores';
 import { blobUrlManager, useBlobUrlVersion } from '@/infrastructure/browser/blob-url-manager';
@@ -11,8 +11,14 @@ import { useTimelineStore } from '@/features/composition-runtime/deps/stores';
 import { resolveTransform, getSourceDimensions } from '../utils/transform-resolver';
 import { resolveAnimatedTransform, hasKeyframeAnimation } from '@/features/composition-runtime/deps/keyframes';
 import { useItemKeyframesFromContext } from '../contexts/keyframes-context';
+import { KeyframesProvider } from '../contexts/keyframes-context';
 import { CompositionSpaceProvider, useCompositionSpace } from '../contexts/composition-space-context';
 import { Item } from './item';
+import type { MaskInfo } from './item';
+import { resolveActiveShapeMasksAtFrame } from '../utils/frame-scene';
+import {
+  resolveTrackRenderState,
+} from '../utils/scene-assembly';
 
 interface CompositionContentProps {
   item: CompositionItemType;
@@ -88,6 +94,8 @@ export const CompositionContent = React.memo<CompositionContentProps>(({ item, p
   const sequenceContext = useSequenceContext();
   const frame = sequenceContext?.localFrame ?? 0;
   const relativeFrame = frame - ((item as TimelineItem & { _sequenceFrameOffset?: number })._sequenceFrameOffset ?? 0);
+  const sourceOffset = item.sourceStart ?? item.trimStart ?? 0;
+  const subCompFrame = relativeFrame + sourceOffset;
 
   const containerDims = useMemo(() => {
     const canvas = { width: projectWidth, height: projectHeight, fps: mainFps };
@@ -134,6 +142,47 @@ export const CompositionContent = React.memo<CompositionContentProps>(({ item, p
     renderScaleY,
   ]);
 
+  const trackRenderState = useMemo(
+    () => subComp ? resolveTrackRenderState(subComp.tracks) : null,
+    [subComp]
+  );
+  const visibleTrackIds = trackRenderState?.visibleTrackIds ?? new Set<string>();
+  const sortedTracks = trackRenderState?.visibleTracksByOrderDesc ?? [];
+
+  // Resolve active sub-comp masks for the current local frame.
+  // This allows masks authored inside a pre-comp to clip items when viewed
+  // from the parent timeline.
+  const activeMaskInfos = useMemo<MaskInfo[]>(() => {
+    if (!subComp) return [];
+    const canvas = { width: subComp.width, height: subComp.height, fps: subComp.fps };
+    const keyframesById = new Map((subComp.keyframes ?? []).map((kf) => [kf.itemId, kf]));
+    const activeMasks = resolvedItems.filter((subItem): subItem is ShapeItem => (
+      subItem.type === 'shape'
+      && subItem.isMask === true
+      && visibleTrackIds.has(subItem.trackId)
+    ));
+
+    return resolveActiveShapeMasksAtFrame(
+      activeMasks,
+      {
+        canvas,
+        frame: subCompFrame,
+        getKeyframes: (itemId) => keyframesById.get(itemId),
+      }
+    ).map(({ shape, transform }) => ({
+      shape,
+      transform: {
+        x: transform.x,
+        y: transform.y,
+        width: transform.width,
+        height: transform.height,
+        rotation: transform.rotation,
+        opacity: transform.opacity,
+        cornerRadius: transform.cornerRadius,
+      },
+    }));
+  }, [resolvedItems, visibleTrackIds, subComp?.width, subComp?.height, subComp?.fps, subComp?.keyframes, subCompFrame]);
+
   if (!subComp) {
     return (
       <AbsoluteFill
@@ -152,9 +201,6 @@ export const CompositionContent = React.memo<CompositionContentProps>(({ item, p
   // CSS scale from sub-comp native resolution to parent container dimensions
   const scaleX = subComp.width > 0 ? containerDims.width / subComp.width : 1;
   const scaleY = subComp.height > 0 ? containerDims.height / subComp.height : 1;
-
-  // Sort tracks so lower order renders first (bottom), higher order on top
-  const sortedTracks = [...subComp.tracks].sort((a, b) => b.order - a.order);
 
   return (
     <div style={{
@@ -177,26 +223,31 @@ export const CompositionContent = React.memo<CompositionContentProps>(({ item, p
           fps={subComp.fps}
           durationInFrames={subComp.durationInFrames}
         >
-          <AbsoluteFill>
-            {sortedTracks.map((track) => {
-              if (!track.visible) return null;
+          <KeyframesProvider keyframes={subComp.keyframes}>
+            <AbsoluteFill>
+              {sortedTracks.map((track) => {
+                if (!track.visible) return null;
 
-              const trackItems = resolvedItems.filter((i) => i.trackId === track.id);
+                const trackItems = resolvedItems.filter((i) => (
+                  i.trackId === track.id
+                  // Mask shapes are control items and should not render visually.
+                  && !(i.type === 'shape' && i.isMask)
+                ));
 
-              return trackItems.map((subItem) => (
-                <Sequence
-                  key={subItem.id}
-                  from={subItem.from}
-                  durationInFrames={subItem.durationInFrames}
-                >
-                  <Item item={subItem} muted={parentMuted || track.muted} masks={[]} renderDepth={renderDepth} />
-                </Sequence>
-              ));
-            })}
-          </AbsoluteFill>
+                return trackItems.map((subItem) => (
+                  <Sequence
+                    key={subItem.id}
+                    from={subItem.from}
+                    durationInFrames={subItem.durationInFrames}
+                  >
+                    <Item item={subItem} muted={parentMuted || track.muted} masks={activeMaskInfos} renderDepth={renderDepth} />
+                  </Sequence>
+                ));
+              })}
+            </AbsoluteFill>
+          </KeyframesProvider>
         </VideoConfigProvider>
       </CompositionSpaceProvider>
     </div>
   );
 });
-

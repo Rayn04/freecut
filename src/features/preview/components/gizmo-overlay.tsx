@@ -6,6 +6,8 @@ import { useTimelineStore } from '@/features/preview/deps/timeline-store';
 import { usePlaybackStore } from '@/shared/state/playback';
 import { getResolvedPlaybackFrame } from '@/shared/state/playback/frame-resolution';
 import { useGizmoStore } from '../stores/gizmo-store';
+import { useCornerPinStore } from '../stores/corner-pin-store';
+import { useMaskEditorStore } from '../stores/mask-editor-store';
 import { TransformGizmo } from './transform-gizmo';
 import { GroupGizmo } from './group-gizmo';
 import { SelectableItem } from './selectable-item';
@@ -13,7 +15,7 @@ import { SnapGuides } from './snap-guides';
 import { screenToCanvas, transformToScreenBounds } from '../utils/coordinate-transform';
 import { useMarqueeSelection, isMarqueeJustFinished, type Rect } from '@/hooks/use-marquee-selection';
 import { MarqueeOverlay } from '@/components/marquee-overlay';
-import { useAnimatedTransforms } from '@/features/preview/deps/keyframes';
+import { useVisualTransforms } from '../hooks/use-visual-transform';
 import {
   getAutoKeyframeOperation,
   GIZMO_ANIMATABLE_PROPS,
@@ -149,6 +151,8 @@ export function GizmoOverlay({
   const setCanvasSize = useGizmoStore((s) => s.setCanvasSize);
   const setSnappingEnabled = useGizmoStore((s) => s.setSnappingEnabled);
   const snapLines = useGizmoStore((s) => s.snapLines);
+  const isCornerPinEditing = useCornerPinStore((s) => s.isEditing);
+  const isMaskEditing = useMaskEditorStore((s) => s.isEditing);
   const startTranslate = useGizmoStore((s) => s.startTranslate);
   const updateInteraction = useGizmoStore((s) => s.updateInteraction);
   const endInteraction = useGizmoStore((s) => s.endInteraction);
@@ -218,16 +222,16 @@ export function GizmoOverlay({
     };
   }, [containerRect, playerSize, projectSize, zoom]);
 
-  // Get animated transforms for all visible items using centralized hook
-  const animatedTransformsMap = useAnimatedTransforms(visibleItems, projectSize);
+  // Get visual transforms for all visible items (base + keyframes + preview).
+  const visualTransformsMap = useVisualTransforms(visibleItems, projectSize);
 
   // Create marquee items with pre-computed bounding rects for collision detection
   // Rects are calculated once when items/coords change, not on every mouse move
   const marqueeItems = useMemo(() => {
     if (!coordParams || !containerRect) return [];
     return visibleItems.map((item) => {
-      // Get pre-computed animated transform from the hook
-      const resolved = animatedTransformsMap.get(item.id);
+      // Get pre-computed visual transform from the hook
+      const resolved = visualTransformsMap.get(item.id);
       if (!resolved) return { id: item.id, getBoundingRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }) };
 
       const screenBounds = transformToScreenBounds(
@@ -255,7 +259,7 @@ export function GizmoOverlay({
         getBoundingRect: () => rect,
       };
     });
-  }, [visibleItems, coordParams, containerRect, animatedTransformsMap]);
+  }, [visibleItems, coordParams, containerRect, visualTransformsMap]);
 
   // Marquee selection hook
   // Use hitAreaRef for bounds checking (fills container), overlayRef for coordinate display
@@ -433,8 +437,8 @@ export function GizmoOverlay({
       const result: TimelineItem[] = [];
 
       for (const item of visibleItems) {
-        // Get animated transform from the pre-computed map
-        const resolved = animatedTransformsMap.get(item.id);
+        // Get visual transform from the pre-computed map
+        const resolved = visualTransformsMap.get(item.id);
         if (!resolved) continue;
 
         // Convert transform position to absolute canvas coordinates
@@ -459,7 +463,7 @@ export function GizmoOverlay({
 
       return result;
     },
-    [visibleItems, projectSize, animatedTransformsMap]
+    [visibleItems, projectSize, visualTransformsMap]
   );
 
   // Handle right-click to show context menu for overlapping items
@@ -580,10 +584,11 @@ export function GizmoOverlay({
       }}
       onDoubleClick={(e) => e.stopPropagation()}
     >
-      {/* Marquee selection rectangle */}
-      <MarqueeOverlay marqueeState={marqueeState} />
+      {/* Marquee selection rectangle - hidden during corner pin / mask editing */}
+      {!isCornerPinEditing && !isMaskEditing && <MarqueeOverlay marqueeState={marqueeState} />}
 
       {/* Player area - receives clicks for deselection and contains gizmos */}
+      {/* Disabled entirely during corner pin / mask editing so the overlay gets exclusive input */}
       <div
         className="absolute"
         style={{
@@ -591,25 +596,38 @@ export function GizmoOverlay({
           left: overlayPadding,
           width: playerSize.width,
           height: playerSize.height,
-          pointerEvents: 'auto',
+          pointerEvents: (isCornerPinEditing || isMaskEditing) ? 'none' : 'auto',
         }}
         onClick={handleBackgroundClick}
         onContextMenu={handleContextMenu}
       >
         {/* Clickable areas for UNSELECTED visible items */}
         {/* Selected items are handled by their respective gizmos (TransformGizmo or GroupGizmo) */}
-        {unselectedItems.map((item) => (
-          <SelectableItem
-            key={item.id}
-            item={item}
-            coordParams={coordParams}
-            onSelect={(e) => handleItemClick(item.id, e)}
-            onDragStart={(e, transform) => handleItemDragStart(item.id, e, transform)}
-          />
-        ))}
+        {unselectedItems.map((item) => {
+          const resolved = visualTransformsMap.get(item.id);
+          if (!resolved) return null;
+          return (
+            <SelectableItem
+              key={item.id}
+              item={item}
+              transform={{
+                x: resolved.x,
+                y: resolved.y,
+                width: resolved.width,
+                height: resolved.height,
+                rotation: resolved.rotation,
+                opacity: resolved.opacity,
+                cornerRadius: resolved.cornerRadius,
+              }}
+              coordParams={coordParams}
+              onSelect={(e) => handleItemClick(item.id, e)}
+              onDragStart={(e, transform) => handleItemDragStart(item.id, e, transform)}
+            />
+          );
+        })}
 
-        {/* Transform gizmo(s) for selected items - single or group */}
-        {selectedItems.length === 1 && selectedItems[0] ? (
+        {/* Transform gizmo(s) for selected items - hidden during corner pin / mask editing */}
+        {(isCornerPinEditing || isMaskEditing) ? null : selectedItems.length === 1 && selectedItems[0] ? (
           <TransformGizmo
             item={selectedItems[0]}
             coordParams={coordParams}

@@ -20,10 +20,11 @@ import type {
   VideoItem,
   ImageItem,
   ShapeItem,
-  AdjustmentItem,
   CompositionItem,
 } from '@/types/timeline';
 import type { ItemKeyframes } from '@/types/keyframe';
+import type { ItemEffect } from '@/types/effects';
+import type { ResolvedTransform } from '@/types/transform';
 import { createLogger } from '@/shared/logging/logger';
 import { blobUrlManager } from '@/infrastructure/browser/blob-url-manager';
 import { resolveMediaUrl } from '@/features/export/deps/media-library';
@@ -32,11 +33,17 @@ import { VideoSourcePool } from '@/features/export/deps/player-contract';
 // Import subsystems
 import { getAnimatedTransform, buildKeyframesMap } from './canvas-keyframes';
 import {
-  applyAllEffects,
+  applyAllEffectsAsync,
   getAdjustmentLayerEffects,
   combineEffects,
+  getGpuEffectInstances,
   type AdjustmentLayerWithTrackOrder,
 } from './canvas-effects';
+import { EffectsPipeline } from '@/infrastructure/gpu/effects';
+import { TransitionPipeline } from '@/infrastructure/gpu/transitions';
+import { CompositorPipeline, DEFAULT_LAYER_PARAMS } from '@/infrastructure/gpu/compositor';
+import type { CompositeLayer } from '@/infrastructure/gpu/compositor';
+import { MaskTextureManager } from '@/infrastructure/gpu/masks';
 import {
   applyMasks,
   buildMaskFrameIndex,
@@ -44,26 +51,33 @@ import {
   type MaskCanvasSettings,
 } from './canvas-masks';
 import {
-  createTransitionFrameIndex,
-  getTransitionFrameState,
-  buildClipMap,
   type ActiveTransition,
 } from './canvas-transitions';
 import { type CachedGifFrames, gifFrameCache } from '@/features/export/deps/timeline';
 import { isGifUrl, isWebpUrl } from '@/utils/media-utils';
 import { CanvasPool, TextMeasurementCache } from './canvas-pool';
 import { SharedVideoExtractorPool, type VideoFrameSource } from './shared-video-extractor';
+import { getCompositeOperation } from '@/types/blend-mode-css';
 import { useCompositionsStore } from '@/features/export/deps/timeline';
 
 // Item renderer
 import {
+  hasCornerPin,
+  resolveFrameCompositionScene,
+  resolveCompositionRenderPlan,
+  collectFrameVideoCandidates,
+  resolveFrameRenderScene,
+} from '@/features/export/deps/composition-runtime';
+import {
   renderItem,
   renderTransitionToCanvas,
+  calculateMediaDrawDimensions,
   type CanvasSettings,
   type WorkerLoadedImage,
   type ItemRenderContext,
   type SubCompRenderData,
 } from './canvas-item-renderer';
+import { ScrubbingCache } from '@/features/export/deps/preview';
 
 // Re-export orchestration functions so existing import sites keep working
 export { renderComposition, renderAudioOnly, renderSingleFrame } from './canvas-render-orchestrator';
@@ -108,7 +122,13 @@ export async function createCompositionRenderer(
   composition: CompositionInputProps,
   canvas: OffscreenCanvas,
   ctx: OffscreenCanvasRenderingContext2D,
-  options: { mode?: 'export' | 'preview' } = {},
+  options: {
+    mode?: 'export' | 'preview';
+    getPreviewTransformOverride?: (itemId: string) => Partial<ResolvedTransform> | undefined;
+    getPreviewEffectsOverride?: (itemId: string) => ItemEffect[] | undefined;
+    getPreviewCornerPinOverride?: (itemId: string) => TimelineItem['cornerPin'] | undefined;
+    domVideoElementProvider?: (itemId: string) => HTMLVideoElement | null;
+  } = {},
 ) {
   const {
     fps,
@@ -118,6 +138,10 @@ export async function createCompositionRenderer(
     keyframes = [],
   } = composition;
   const renderMode = options.mode ?? 'export';
+  const getPreviewTransformOverride = options.getPreviewTransformOverride;
+  const getPreviewEffectsOverride = options.getPreviewEffectsOverride;
+  const getPreviewCornerPinOverride = options.getPreviewCornerPinOverride;
+  const domVideoElementProvider = options.domVideoElementProvider;
   const hasDom = typeof document !== 'undefined';
   const previewStrictDecode = renderMode === 'preview';
 
@@ -127,14 +151,14 @@ export async function createCompositionRenderer(
     fps,
   };
 
-  // Match MainComposition visibility semantics:
-  // - If any track is soloed, only solo tracks are considered renderable.
-  // - Otherwise, render tracks whose visible flag is not explicitly false.
-  const hasSoloTracks = tracks.some((track) => track.solo);
-  const isTrackRenderable = (track: CompositionInputProps['tracks'][number]) => {
-    if (hasSoloTracks) return track.solo === true;
-    return track.visible !== false;
-  };
+  const renderPlan = resolveCompositionRenderPlan({ tracks, transitions });
+  const { trackRenderState } = renderPlan;
+  const {
+    visibleTrackIds,
+    visibleTracksByOrderDesc: sortedTracks,
+    visibleTracksByOrderAsc: tracksTopToBottom,
+    trackOrderMap,
+  } = trackRenderState;
 
   // === PERFORMANCE OPTIMIZATION: Canvas Pool ===
   // Pre-allocate reusable canvases instead of creating new ones per frame
@@ -143,6 +167,57 @@ export async function createCompositionRenderer(
 
   // === PERFORMANCE OPTIMIZATION: Text Measurement Cache ===
   const textMeasureCache = new TextMeasurementCache();
+
+  // === 3-TIER SCRUBBING CACHE (preview only) ===
+  // Tier 1: GPU textures in VRAM for instant scrub (~0.1ms blit)
+  // Tier 2: Per-video last-frame for instant clip boundary display
+  // Tier 3: Deep RAM ImageBitmap buffer (~900 frames) with GPU promotion
+  // When all tiers are warm, scrubbing doesn't decode at all.
+  const FRAME_CACHE_ENABLED = renderMode === 'preview';
+  const scrubbingCache = FRAME_CACHE_ENABLED
+    ? new ScrubbingCache()
+    : null;
+  let lastRenderedFrame = -1;
+
+  // === GPU Effects Pipeline ===
+  // Lazily initialized on first use to avoid blocking startup
+  let gpuPipeline: EffectsPipeline | null = null;
+  let gpuPipelineInitPromise: Promise<EffectsPipeline | null> | null = null;
+  const ensureGpuPipeline = async (): Promise<EffectsPipeline | null> => {
+    if (gpuPipeline) return gpuPipeline;
+    if (gpuPipelineInitPromise) return gpuPipelineInitPromise;
+    gpuPipelineInitPromise = EffectsPipeline.create().then((p) => {
+      gpuPipeline = p;
+      gpuPipelineInitPromise = null;
+      return p;
+    });
+    return gpuPipelineInitPromise;
+  };
+
+  // === GPU Transition Pipeline ===
+  // Shares the GPU device with the effects pipeline
+  let gpuTransitionPipeline: TransitionPipeline | null = null;
+
+  function ensureGpuTransitionPipeline(): boolean {
+    if (gpuTransitionPipeline) return true;
+    if (!gpuPipeline) return false;
+    gpuTransitionPipeline = TransitionPipeline.create(gpuPipeline.getDevice());
+    return gpuTransitionPipeline !== null;
+  }
+
+  // === GPU Compositor (for pixel-perfect blend modes) ===
+  // Lazily created from the effects pipeline's GPU device
+  let gpuCompositor: CompositorPipeline | null = null;
+  let gpuMaskManager: MaskTextureManager | null = null;
+
+  function ensureGpuCompositor(): boolean {
+    if (gpuCompositor) return true;
+    if (!gpuPipeline) return false;
+    const device = gpuPipeline.getDevice();
+    gpuCompositor = new CompositorPipeline(device);
+    gpuMaskManager = new MaskTextureManager(device);
+    return true;
+  }
 
   // Build lookup maps
   const keyframesMap = buildKeyframesMap(keyframes);
@@ -296,41 +371,10 @@ export async function createCompositionRenderer(
   }
 
   // Collect adjustment layers
-  const adjustmentLayers: AdjustmentLayerWithTrackOrder[] = [];
-  for (const track of tracks) {
-    if (!isTrackRenderable(track)) continue;
-    for (const item of track.items) {
-      if (item.type === 'adjustment') {
-        adjustmentLayers.push({
-          layer: item as AdjustmentItem,
-          trackOrder: track.order ?? 0,
-        });
-      }
-    }
-  }
+  const adjustmentLayers = renderPlan.visibleAdjustmentLayers as AdjustmentLayerWithTrackOrder[];
 
-  // Build clip map for transitions
-  const allClips: TimelineItem[] = [];
-  for (const track of tracks) {
-    for (const item of track.items) {
-      if (item.type === 'video' || item.type === 'image') {
-        allClips.push(item);
-      }
-    }
-  }
-  const clipMap = buildClipMap(allClips);
-
-  // Precompute frame-invariant render metadata.
-  const sortedTracks = [...tracks].sort((a, b) => (b.order ?? 0) - (a.order ?? 0));
-  const tracksTopToBottom = [...sortedTracks].reverse();
-  const trackOrderMap = new Map<string, number>();
-  for (const track of tracks) {
-    trackOrderMap.set(track.id, track.order ?? 0);
-  }
-
-  const transitionFrameIndex = createTransitionFrameIndex(transitions, clipMap);
   const transitionTrackOrderById = new Map<string, number>();
-  for (const window of transitionFrameIndex.windows) {
+  for (const window of renderPlan.transitionWindows) {
     const transitionTrackId = window.transition.trackId;
     const trackOrder = transitionTrackId
       ? (trackOrderMap.get(transitionTrackId) ?? 0)
@@ -376,6 +420,9 @@ export async function createCompositionRenderer(
     keyframesMap,
     adjustmentLayers,
     subCompRenderData,
+    gpuPipeline: null,
+    gpuTransitionPipeline: null,
+    domVideoElementProvider,
   };
 
   const getPrewarmContext = (): OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null => {
@@ -449,7 +496,7 @@ export async function createCompositionRenderer(
     const ids: string[] = [];
 
     for (const track of tracks) {
-      if (!isTrackRenderable(track)) continue;
+      if (!visibleTrackIds.has(track.id)) continue;
       for (const item of track.items ?? []) {
         if (item.type !== 'video') continue;
         const start = item.from;
@@ -942,19 +989,38 @@ export async function createCompositionRenderer(
     },
 
     async renderFrame(frame: number) {
+      // 3-tier cache lookup (preview only)
+      // Tier 1 (GPU texture) → Tier 3 (RAM ImageBitmap) → miss → full render
+      if (scrubbingCache) {
+        const cached = scrubbingCache.getFrame(frame);
+        if (cached) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(cached, 0, 0);
+          return;
+        }
+      }
+
       // Clear canvas
       ctx.fillStyle = backgroundColor;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       // Prepare masks for this frame
-      const activeMasks = getActiveMasksForFrame(maskFrameIndex, frame);
-
-      // Find active transitions
-      const { activeTransitions, transitionClipIds } = getTransitionFrameState(
-        transitionFrameIndex,
+      const activeMasks = getActiveMasksForFrame(
+        maskFrameIndex,
         frame,
-        fps
+        maskSettings,
+        keyframesMap,
+        renderMode === 'preview' ? getPreviewTransformOverride : undefined
       );
+
+      const frameScene = resolveFrameCompositionScene({
+        renderPlan,
+        frame,
+        canvas: canvasSettings,
+        getKeyframes: (itemId) => keyframesMap.get(itemId),
+        getPreviewTransform: renderMode === 'preview' ? getPreviewTransformOverride : undefined,
+      });
+      const { activeTransitions, transitionClipIds } = frameScene.transitionFrameState;
 
       // Debug: Log transition state at key frames (only in development)
       if (import.meta.env.DEV && activeTransitions.length > 0 && (frame === activeTransitions[0]?.transitionStart || frame % 30 === 0)) {
@@ -975,22 +1041,124 @@ export async function createCompositionRenderer(
       const { canvas: contentCanvas, ctx: contentCtx } = canvasPool.acquire();
 
 
-      // Helper function to render a single item with effects
+      // GPU batch mode: each item's GPU effects submit immediately via pooled
+      // output canvases, but we defer compositing so the GPU can pipeline work.
+      let useBatch = false;
+
+      // Check if any active items have GPU effects
+      // and eagerly init the pipeline + start batch before processing items
+      {
+        let hasAnyGpuEffects = false;
+        for (const track of sortedTracks) {
+          if (!visibleTrackIds.has(track.id)) continue;
+          for (const item of track.items ?? []) {
+            if (frame < item.from || frame >= item.from + item.durationInFrames) continue;
+            if (item.effects?.some((e) => e.enabled && e.effect.type === 'gpu-effect')) {
+              hasAnyGpuEffects = true;
+              break;
+            }
+          }
+          if (hasAnyGpuEffects) break;
+        }
+        if (hasAnyGpuEffects || activeTransitions.length > 0) {
+          if (!itemRenderContext.gpuPipeline) {
+            itemRenderContext.gpuPipeline = await ensureGpuPipeline();
+          }
+          if (itemRenderContext.gpuPipeline) {
+            if (hasAnyGpuEffects) {
+              itemRenderContext.gpuPipeline.beginBatch();
+              useBatch = true;
+            }
+            // Initialize GPU transition pipeline (shares device with effects pipeline)
+            if (activeTransitions.length > 0 && !itemRenderContext.gpuTransitionPipeline) {
+              ensureGpuTransitionPipeline();
+              itemRenderContext.gpuTransitionPipeline = gpuTransitionPipeline;
+            }
+          }
+        }
+      }
+
+      /**
+       * Render a single item with effects. Returns the canvas to composite
+       * (and canvases to release) for deferred compositing, or composites
+       * immediately in export mode.
+       */
       const renderItemWithEffects = async (
         item: TimelineItem,
-        trackOrder: number
-      ) => {
+        trackOrder: number,
+        deferred: boolean,
+      ): Promise<{ source: OffscreenCanvas; poolCanvases: OffscreenCanvas[] } | null> => {
         // Get animated transform
         const itemKeyframes = keyframesMap.get(item.id);
-        const transform = getAnimatedTransform(item, itemKeyframes, frame, canvasSettings);
+        let transform = getAnimatedTransform(item, itemKeyframes, frame, canvasSettings);
+        if (renderMode === 'preview') {
+          const previewOverride = getPreviewTransformOverride?.(item.id);
+          if (previewOverride) {
+            transform = {
+              ...transform,
+              ...previewOverride,
+              cornerRadius: previewOverride.cornerRadius ?? transform.cornerRadius,
+            };
+          }
+        }
 
-        // Get effects (item effects + adjustment layer effects)
+        // Apply corner pin preview override during interactive drag
+        let effectiveItem = item;
+        if (renderMode === 'preview') {
+          const cornerPinOverride = getPreviewCornerPinOverride?.(item.id);
+          if (cornerPinOverride !== undefined) {
+            effectiveItem = { ...item, cornerPin: cornerPinOverride };
+          }
+        }
+
+        // Get effects (preview override → item effects + adjustment layer effects)
+        const itemEffects = (renderMode === 'preview' ? getPreviewEffectsOverride?.(item.id) : undefined) ?? effectiveItem.effects;
         const adjEffects = getAdjustmentLayerEffects(
           trackOrder,
           adjustmentLayers,
           frame
         );
-        const combinedEffects = combineEffects(item.effects, adjEffects);
+        const combinedEffects = combineEffects(itemEffects, adjEffects);
+
+        // === DIRECT VIDEO→GPU PATH (importExternalTexture) ===
+        // When a video item has ONLY GPU effects, a DOM video element is available,
+        // and the transform is simple (no rotation/corner-radius/corner-pin that need canvas 2D),
+        // skip canvas 2D entirely and go: video → importExternalTexture → GPU effects → output.
+        if (
+          renderMode === 'preview'
+          && item.type === 'video'
+          && combinedEffects.length > 0
+          && combinedEffects.every((e) => !e.enabled || e.effect.type === 'gpu-effect')
+          && transform.rotation === 0
+          && transform.cornerRadius === 0
+          && transform.opacity === 1
+          && !hasCornerPin(effectiveItem.cornerPin)
+          && itemRenderContext.domVideoElementProvider
+        ) {
+          const domVideo = itemRenderContext.domVideoElementProvider(item.id);
+          if (domVideo && domVideo.readyState >= 2 && domVideo.videoWidth > 0) {
+            if (!itemRenderContext.gpuPipeline) {
+              itemRenderContext.gpuPipeline = await ensureGpuPipeline();
+            }
+            if (itemRenderContext.gpuPipeline) {
+              const gpuInstances = getGpuEffectInstances(combinedEffects);
+              const drawDims = calculateMediaDrawDimensions(
+                domVideo.videoWidth, domVideo.videoHeight, transform, canvasSettings,
+              );
+              const gpuCanvas = itemRenderContext.gpuPipeline.applyEffectsToVideo(
+                domVideo, gpuInstances, drawDims, canvasSettings.width, canvasSettings.height,
+              );
+              if (gpuCanvas) {
+                if (deferred) {
+                  return { source: gpuCanvas, poolCanvases: [] };
+                }
+                contentCtx.drawImage(gpuCanvas, 0, 0);
+                return null;
+              }
+            }
+            // Fall through to standard path if importExternalTexture failed
+          }
+        }
 
         // === PERFORMANCE: Use pooled canvas instead of creating new one ===
         const { canvas: itemCanvas, ctx: itemCtx } = canvasPool.acquire();
@@ -998,24 +1166,40 @@ export async function createCompositionRenderer(
         // Render based on item type
         await renderItem(
           itemCtx,
-          item,
+          effectiveItem,
           transform,
           frame,
           itemRenderContext
         );
 
-        // Apply effects
+        // Apply effects (per-item — GPU effects applied here for both preview and export)
         if (combinedEffects.length > 0) {
+          const hasGpu = combinedEffects.some((e) => e.enabled && e.effect.type === 'gpu-effect');
+          if (hasGpu && !itemRenderContext.gpuPipeline) {
+            itemRenderContext.gpuPipeline = await ensureGpuPipeline();
+            if (!itemRenderContext.gpuPipeline) {
+              console.warn('[CompositionRenderer] GPU pipeline init failed — GPU effects will be skipped');
+            }
+          }
           const { canvas: effectCanvas, ctx: effectCtx } = canvasPool.acquire();
-          applyAllEffects(effectCtx, itemCanvas, combinedEffects, frame, canvasSettings);
-          contentCtx.drawImage(effectCanvas, 0, 0);
+          const deferredGpuCanvas = await applyAllEffectsAsync(effectCtx, itemCanvas, combinedEffects, frame, canvasSettings, itemRenderContext.gpuPipeline);
+          canvasPool.release(itemCanvas);
+
+          const source = deferredGpuCanvas ?? effectCanvas;
+          if (deferred) {
+            return { source, poolCanvases: [effectCanvas] };
+          }
+          contentCtx.drawImage(source, 0, 0);
           canvasPool.release(effectCanvas);
-        } else {
-          contentCtx.drawImage(itemCanvas, 0, 0);
+          return null;
         }
 
-        // Release item canvas back to pool
+        if (deferred) {
+          return { source: itemCanvas, poolCanvases: [itemCanvas] };
+        }
+        contentCtx.drawImage(itemCanvas, 0, 0);
         canvasPool.release(itemCanvas);
+        return null;
       };
 
       // Helper to check if item should be rendered
@@ -1036,17 +1220,6 @@ export async function createCompositionRenderer(
         if (item.type === 'shape' && (item as ShapeItem).isMask) return false;
         return true;
       };
-      // Group transitions by their track order
-      const transitionsByTrackOrder = new Map<number, ActiveTransition[]>();
-      for (const activeTransition of activeTransitions) {
-        const trackOrder = transitionTrackOrderById.get(activeTransition.transition.id) ?? 0;
-
-        if (!transitionsByTrackOrder.has(trackOrder)) {
-          transitionsByTrackOrder.set(trackOrder, []);
-        }
-        transitionsByTrackOrder.get(trackOrder)!.push(activeTransition);
-      }
-
       // === OCCLUSION CULLING OPTIMIZATION ===
       // Find the topmost (lowest order) track with a fully occluding item.
       // Skip rendering all tracks below it (higher order) since they'll be fully covered.
@@ -1067,6 +1240,12 @@ export async function createCompositionRenderer(
 
         // Items in transitions are blended, not fully occluding
         if (transitionClipIds.has(item.id)) return false;
+
+        // Non-normal blend modes interact with layers below
+        if (item.blendMode && item.blendMode !== 'normal') return false;
+
+        // Corner pin warps the shape, exposing content below
+        if (item.cornerPin) return false;
 
         // Get animated transform at current frame
         const itemKeyframes = keyframesMap.get(item.id);
@@ -1102,9 +1281,7 @@ export async function createCompositionRenderer(
           if (!effectWrapper.enabled) continue;
           const effect = effectWrapper.effect;
           // Effects that could add transparency
-          if (effect.type === 'glitch' ||
-              effect.type === 'canvas-effect' ||
-              ('opacity' in effect && typeof effect.opacity === 'number' && effect.opacity < 1)) {
+          if ('opacity' in effect && typeof effect.opacity === 'number' && effect.opacity < 1) {
             return false;
           }
         }
@@ -1114,27 +1291,29 @@ export async function createCompositionRenderer(
 
       // Find occlusion cutoff â€“ the lowest track order with a fully occluding item
       // If masks are active, disable occlusion culling (masks could reveal content)
-      let occlusionCutoffOrder: number | null = null;
+      const {
+        occlusionCutoffOrder,
+        renderTasks,
+      } = resolveFrameRenderScene<ActiveTransition>({
+        tracksByOrderDesc: sortedTracks,
+        tracksByOrderAsc: tracksTopToBottom,
+        visibleTrackIds,
+        activeTransitions,
+        getTransitionTrackOrder: (activeTransition) => (
+          transitionTrackOrderById.get(activeTransition.transition.id) ?? 0
+        ),
+        disableOcclusion: activeMasks.length > 0,
+        shouldRenderItem,
+        isFullyOccluding,
+      });
 
-      if (activeMasks.length === 0) {
-        // Scan tracks from top to bottom (lowest order first) to find first occluding item
-        for (const track of tracksTopToBottom) {
-          if (!isTrackRenderable(track)) continue;
-          const trackOrder = track.order ?? 0;
-
-          for (const item of track.items ?? []) {
-            if (!shouldRenderItem(item)) continue;
-
-            if (isFullyOccluding(item, trackOrder)) {
-              occlusionCutoffOrder = trackOrder;
-              if (import.meta.env.DEV && frame % 30 === 0) {
-                log.debug(`Occlusion culling: item ${item.id.substring(0, 8)} on track order ${trackOrder} fully occludes canvas`);
-              }
-              break;
-            }
-          }
-
-          if (occlusionCutoffOrder !== null) break;
+      if (occlusionCutoffOrder !== null && import.meta.env.DEV && frame % 30 === 0) {
+        const occludingTask = sortedTracks
+          .filter((track) => visibleTrackIds.has(track.id) && (track.order ?? 0) === occlusionCutoffOrder)
+          .flatMap((track) => track.items ?? [])
+          .find((item) => shouldRenderItem(item) && isFullyOccluding(item, occlusionCutoffOrder));
+        if (occludingTask) {
+          log.debug(`Occlusion culling: item ${occludingTask.id.substring(0, 8)} on track order ${occlusionCutoffOrder} fully occludes canvas`);
         }
       }
 
@@ -1142,33 +1321,135 @@ export async function createCompositionRenderer(
       // Track order: higher values render first (behind), lower values render last (on top)
       let skippedTracks = 0;
 
-      for (const track of sortedTracks) {
-        if (!isTrackRenderable(track)) continue;
-        const trackOrder = track.order ?? 0;
-
-        // OCCLUSION CULLING: Skip tracks that are fully occluded by higher tracks
-        if (occlusionCutoffOrder !== null && trackOrder > occlusionCutoffOrder) {
-          skippedTracks++;
-          continue;
+      // Parallelize item rendering (video decode is the bottleneck).
+      // Collect all renderable items in z-order, fire all renders concurrently,
+      // then composite results in z-order.
+      {
+        if (occlusionCutoffOrder !== null) {
+          skippedTracks = sortedTracks.filter((track) => (
+            visibleTrackIds.has(track.id) && (track.order ?? 0) > occlusionCutoffOrder
+          )).length;
         }
 
-        // Render all items on this track (respecting track order as primary)
-        for (const item of track.items ?? []) {
-          if (!shouldRenderItem(item)) continue;
-          await renderItemWithEffects(item, trackOrder);
+        // Fire all item renders in parallel (video decodes run concurrently)
+        const results = await Promise.all(
+          renderTasks.map(async (task) => {
+            if (task.type === 'item') {
+              return renderItemWithEffects(task.item, task.trackOrder, true);
+            }
+            // Transitions: render to a dedicated canvas
+            const { canvas: trCanvas, ctx: trCtx } = canvasPool.acquire();
+            await renderTransitionToCanvas(trCtx, task.transition, frame, itemRenderContext, task.trackOrder);
+            return { source: trCanvas, poolCanvases: [trCanvas] } as { source: OffscreenCanvas; poolCanvases: OffscreenCanvas[] };
+          }),
+        );
+
+        // End GPU pool mode before compositing
+        if (useBatch && itemRenderContext.gpuPipeline) {
+          itemRenderContext.gpuPipeline.endBatch();
         }
 
-        // Render transitions that belong to this track (after the track's items)
-        const trackTransitions = transitionsByTrackOrder.get(trackOrder);
-        if (trackTransitions) {
-          for (const activeTransition of trackTransitions) {
-            await renderTransitionToCanvas(
-              contentCtx,
-              activeTransition,
-              frame,
-              itemRenderContext,
-              trackOrder
+        // Composite all results in z-order (preserved by renderTasks ordering)
+        // Use GPU compositor for pixel-perfect blend modes when available
+        const hasNonNormalBlend = renderTasks.some(
+          (t) => t.type === 'item' && t.item.blendMode && t.item.blendMode !== 'normal',
+        );
+        const useGpuCompositor = hasNonNormalBlend && gpuPipeline && ensureGpuCompositor();
+
+        if (useGpuCompositor && gpuCompositor && gpuMaskManager) {
+          // GPU compositing path — pixel-perfect blend modes via WebGPU
+          const device = gpuPipeline!.getDevice();
+          const w = canvasSettings.width;
+          const h = canvasSettings.height;
+          const layers: CompositeLayer[] = [];
+          const layerTextures: GPUTexture[] = [];
+
+          for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            if (!result) continue;
+
+            const task = renderTasks[i]!;
+            const blendMode = task.type === 'item' ? (task.item.blendMode ?? 'normal') : 'normal';
+
+            // Upload item canvas to GPU texture
+            const tex = device.createTexture({
+              size: [w, h],
+              format: 'rgba8unorm',
+              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            device.queue.copyExternalImageToTexture(
+              { source: result.source, flipY: false },
+              { texture: tex },
+              { width: w, height: h },
             );
+            layerTextures.push(tex);
+
+            layers.push({
+              params: { ...DEFAULT_LAYER_PARAMS, blendMode, sourceAspect: w / h, outputAspect: w / h },
+              textureView: tex.createView(),
+              maskView: gpuMaskManager.getFallbackView(),
+            });
+
+            for (const c of result.poolCanvases) canvasPool.release(c);
+          }
+
+          if (layers.length > 0) {
+            const commandEncoder = device.createCommandEncoder();
+            const composited = gpuCompositor.compositeToTexture(layers, w, h, commandEncoder);
+
+            if (composited) {
+              // Readback composited result to Canvas2D
+              const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
+              const readBuffer = device.createBuffer({
+                size: bytesPerRow * h,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+              });
+              commandEncoder.copyTextureToBuffer(
+                { texture: composited.texture },
+                { buffer: readBuffer, bytesPerRow },
+                { width: w, height: h },
+              );
+              device.queue.submit([commandEncoder.finish()]);
+
+              await readBuffer.mapAsync(GPUMapMode.READ);
+              const mapped = new Uint8Array(readBuffer.getMappedRange());
+              const pixels = new Uint8ClampedArray(w * h * 4);
+              for (let row = 0; row < h; row++) {
+                pixels.set(
+                  mapped.subarray(row * bytesPerRow, row * bytesPerRow + w * 4),
+                  row * w * 4,
+                );
+              }
+              readBuffer.unmap();
+              readBuffer.destroy();
+
+              contentCtx.putImageData(new ImageData(pixels, w, h), 0, 0);
+            } else {
+              device.queue.submit([commandEncoder.finish()]);
+            }
+          }
+
+          // Destroy per-frame textures
+          for (const tex of layerTextures) tex.destroy();
+        } else {
+          // Canvas2D compositing fallback
+          for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            if (!result) continue;
+
+            const task = renderTasks[i]!;
+            const blendMode = task.type === 'item' ? task.item.blendMode : undefined;
+            if (blendMode && blendMode !== 'normal') {
+              contentCtx.globalCompositeOperation = getCompositeOperation(blendMode);
+            }
+
+            contentCtx.drawImage(result.source, 0, 0);
+
+            if (blendMode && blendMode !== 'normal') {
+              contentCtx.globalCompositeOperation = 'source-over';
+            }
+
+            for (const c of result.poolCanvases) canvasPool.release(c);
           }
         }
       }
@@ -1187,6 +1468,24 @@ export async function createCompositionRenderer(
 
       // Release content canvas back to pool
       canvasPool.release(contentCanvas);
+
+      // Cache the rendered frame into Tier 1 (GPU) + Tier 3 (RAM).
+      // Skip during rapid forward skimming (frame = last+1..+3) — mediabunny
+      // sequential decode is ~1ms/frame, faster than cache write overhead
+      // (~2-5ms createImageBitmap + GPU upload + GC pressure). Cache on
+      // backward seeks (mediabunny stream restart = seconds), jumps, and
+      // non-sequential access where the cache actually helps.
+      if (scrubbingCache) {
+        const delta = frame - lastRenderedFrame;
+        const isSequentialForward = delta > 0 && delta <= 3;
+        lastRenderedFrame = frame;
+        if (!isSequentialForward) {
+          if (gpuPipeline) {
+            scrubbingCache.setGpuDevice(gpuPipeline.getDevice(), canvas.width, canvas.height);
+          }
+          scrubbingCache.cacheFrame(frame, canvas).catch(() => {});
+        }
+      }
     },
 
     async prewarmFrame(frame: number) {
@@ -1195,20 +1494,15 @@ export async function createCompositionRenderer(
       const ctx2d = getPrewarmContext();
       if (!ctx2d) return;
 
-      const candidates: VideoItem[] = [];
       const minFrame = frame - 1;
       const maxFrame = frame + 1;
-
-      for (const track of tracksTopToBottom) {
-        if (!isTrackRenderable(track)) continue;
-        for (const item of track.items ?? []) {
-          if (item.type !== 'video') continue;
-          if (item.from > maxFrame || (item.from + item.durationInFrames) <= minFrame) continue;
-          candidates.push(item as VideoItem);
-          if (candidates.length >= PREWARM_DECODE_MAX_ITEMS) break;
-        }
-        if (candidates.length >= PREWARM_DECODE_MAX_ITEMS) break;
-      }
+      const candidates = collectFrameVideoCandidates({
+        tracksByOrderAsc: tracksTopToBottom,
+        visibleTrackIds,
+        minFrame,
+        maxFrame,
+        maxItems: PREWARM_DECODE_MAX_ITEMS,
+      });
 
       const missingCandidateItemIds = candidates
         .map((item) => item.id)
@@ -1265,6 +1559,20 @@ export async function createCompositionRenderer(
       }
     },
 
+    setDomVideoElementProvider(provider: ((itemId: string) => HTMLVideoElement | null) | undefined) {
+      itemRenderContext.domVideoElementProvider = provider;
+    },
+
+    /** Evict specific frames from the render cache (e.g. after effect param changes). */
+    invalidateFrameCache(frames?: number[]) {
+      scrubbingCache?.invalidate(frames);
+    },
+
+    /** Get the scrubbing cache instance for stats/GPU wiring. */
+    getScrubbingCache(): ScrubbingCache | null {
+      return scrubbingCache;
+    },
+
     dispose() {
       isDisposed = true;
       inFlightInitByItem.clear();
@@ -1307,6 +1615,16 @@ export async function createCompositionRenderer(
       prewarmAttempted = false;
 
       // === PERFORMANCE: Clean up optimization resources ===
+      scrubbingCache?.dispose();
+
+      gpuCompositor?.destroy();
+      gpuCompositor = null;
+      gpuMaskManager?.destroy();
+      gpuMaskManager = null;
+      gpuTransitionPipeline?.destroy();
+      gpuTransitionPipeline = null;
+      gpuPipeline?.destroy();
+      gpuPipeline = null;
       canvasPool.dispose();
       textMeasureCache.clear();
 
