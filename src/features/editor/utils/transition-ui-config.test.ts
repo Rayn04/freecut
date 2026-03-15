@@ -46,4 +46,11 @@ describe('transition-ui-config', () => {
     expect(chromaticConfigs.some((config) => config.id === 'chromatic')).toBe(true);
     expect(customConfigs.some((config) => config.id === 'chromatic')).toBe(false);
   });
+
+  it('shows sparkles in the custom category', () => {
+    const customConfigs = TRANSITION_CONFIGS_BY_CATEGORY.custom ?? [];
+
+    expect(customConfigs.some((config) => config.id === 'sparkles')).toBe(true);
+    expect((TRANSITION_CONFIGS_BY_CATEGORY.light ?? []).some((config) => config.id === 'sparkles')).toBe(false);
+  });
 });

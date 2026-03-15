@@ -38,9 +38,15 @@ class GpuTextureCache {
     this.device = device;
     this.texW = width;
     this.texH = height;
-    // Adaptive sizing: cap by VRAM budget (~500MB)
+    // Adaptive VRAM budget based on detected device memory.
+    // navigator.deviceMemory (GB, rounded) is available in Chromium — use as proxy
+    // for GPU memory on integrated GPUs. Fall back to conservative 500MB.
+    const deviceMemoryGb = (navigator as { deviceMemory?: number }).deviceMemory;
+    const vramBudgetBytes = deviceMemoryGb !== undefined
+      ? Math.min(deviceMemoryGb * 0.125, 1) * 1_000_000_000 // 12.5% of system RAM, max 1GB
+      : 500_000_000; // conservative default (~500MB)
     const bytesPerFrame = width * height * 4;
-    this.maxFrames = Math.min(this.maxFrames, Math.floor(500_000_000 / bytesPerFrame));
+    this.maxFrames = Math.min(this.maxFrames, Math.floor(vramBudgetBytes / bytesPerFrame));
   }
 
   get(frame: number): GpuCacheEntry | undefined {
@@ -110,8 +116,10 @@ class GpuTextureCache {
 // Tier 2 — Per-Video Last-Frame Cache
 // ---------------------------------------------------------------------------
 
-interface VideoFrameEntry {
-  bitmap: ImageBitmap;
+export type Tier2VideoFrame = ImageBitmap | VideoFrame;
+
+export interface VideoFrameEntry {
+  frame: Tier2VideoFrame;
   sourceTime: number;
 }
 
@@ -122,10 +130,10 @@ class VideoFrameCache {
     return this.cache.get(itemId);
   }
 
-  put(itemId: string, bitmap: ImageBitmap, sourceTime: number): void {
+  put(itemId: string, frame: Tier2VideoFrame, sourceTime: number): void {
     const old = this.cache.get(itemId);
-    if (old) old.bitmap.close();
-    this.cache.set(itemId, { bitmap, sourceTime });
+    if (old) old.frame.close();
+    this.cache.set(itemId, { frame, sourceTime });
   }
 
   has(itemId: string): boolean {
@@ -138,7 +146,7 @@ class VideoFrameCache {
 
   clear(): void {
     for (const entry of this.cache.values()) {
-      entry.bitmap.close();
+      entry.frame.close();
     }
     this.cache.clear();
   }
@@ -309,18 +317,28 @@ export class ScrubbingCache {
   // -----------------------------------------------------------------------
 
   /** Get the last decoded frame for a video item (for instant clip-boundary display). */
-  getVideoFrame(itemId: string): ImageBitmap | undefined {
+  getVideoFrameEntry(
+    itemId: string,
+    sourceTime?: number,
+    maxSourceTimeDelta = Number.POSITIVE_INFINITY,
+  ): VideoFrameEntry | undefined {
     const entry = this.tier2.get(itemId);
-    if (entry) {
-      this._tier2Hits++;
-      return entry.bitmap;
+    if (!entry) {
+      return undefined;
     }
-    return undefined;
+    if (
+      sourceTime !== undefined
+      && Math.abs(entry.sourceTime - sourceTime) > maxSourceTimeDelta
+    ) {
+      return undefined;
+    }
+    this._tier2Hits++;
+    return entry;
   }
 
   /** Cache a decoded video frame for a specific item. */
-  putVideoFrame(itemId: string, bitmap: ImageBitmap, sourceTime: number): void {
-    this.tier2.put(itemId, bitmap, sourceTime);
+  putVideoFrame(itemId: string, frame: Tier2VideoFrame, sourceTime: number): void {
+    this.tier2.put(itemId, frame, sourceTime);
   }
 
   // -----------------------------------------------------------------------
@@ -368,25 +386,30 @@ export class ScrubbingCache {
   /**
    * Cache a fully composited frame into Tier 1 + Tier 3.
    * Call after renderFrame() completes.
+   *
+   * Tier 1 (GPU) is populated synchronously from the canvas via
+   * copyExternalImageToTexture — no bitmap creation needed (<1ms).
+   * Tier 3 (RAM) uses async createImageBitmap in the background.
+   * The source canvas is NOT modified — safe for display canvases.
    */
-  async cacheFrame(frame: number, canvas: OffscreenCanvas): Promise<void> {
-    // Skip if already cached at any tier
-    if (this.tier1.has(frame) && this.tier3.has(frame)) return;
+  cacheFrame(frame: number, canvas: OffscreenCanvas): void {
+    // Tier 1: GPU upload directly from canvas (synchronous, no bitmap copy)
+    if (!this.tier1.has(frame)) {
+      this.tier1.put(frame, canvas);
+    }
 
-    try {
-      const bitmap = await createImageBitmap(canvas);
-
-      // Tier 3: RAM buffer
-      if (!this.tier3.has(frame)) {
-        this.tier3.put(frame, bitmap);
-      }
-
-      // Tier 1: GPU upload (if device is available)
-      if (!this.tier1.has(frame)) {
-        this.tier1.put(frame, bitmap);
-      }
-    } catch {
-      // createImageBitmap can fail if canvas is zero-size
+    // Tier 3: RAM buffer (async bitmap creation in background)
+    if (!this.tier3.has(frame)) {
+      createImageBitmap(canvas).then(
+        (bitmap) => {
+          if (!this.tier3.has(frame)) {
+            this.tier3.put(frame, bitmap);
+          } else {
+            bitmap.close();
+          }
+        },
+        () => { /* canvas may be zero-size or detached */ }
+      );
     }
   }
 

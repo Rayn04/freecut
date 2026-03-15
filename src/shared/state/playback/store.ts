@@ -7,6 +7,13 @@ function normalizeFrame(frame: number): number {
   return Math.max(0, Math.round(frame));
 }
 
+function normalizePreviewQuality(quality: PreviewQuality): PreviewQuality {
+  if (quality === 0.5 || quality === 0.33 || quality === 0.25) {
+    return quality;
+  }
+  return 1;
+}
+
 export const usePlaybackStore = create<PlaybackState & PlaybackActions>()(
   persist(
     (set) => ({
@@ -39,6 +46,27 @@ export const usePlaybackStore = create<PlaybackState & PlaybackActions>()(
           return {
             currentFrame: nextFrame,
             currentFrameEpoch: nextEpoch,
+            frameUpdateEpoch: nextEpoch,
+          };
+        }),
+      setScrubFrame: (frame, itemId) =>
+        set((state) => {
+          const nextFrame = normalizeFrame(frame);
+          const nextItemId = itemId ?? null;
+          if (
+            state.currentFrame === nextFrame
+            && state.previewFrame === nextFrame
+            && state.previewItemId === nextItemId
+          ) {
+            return state;
+          }
+          const nextEpoch = state.frameUpdateEpoch + 1;
+          return {
+            currentFrame: nextFrame,
+            currentFrameEpoch: nextEpoch,
+            previewFrame: nextFrame,
+            previewItemId: nextItemId,
+            previewFrameEpoch: nextEpoch,
             frameUpdateEpoch: nextEpoch,
           };
         }),
@@ -75,9 +103,12 @@ export const usePlaybackStore = create<PlaybackState & PlaybackActions>()(
       setCaptureFrameImageData: (fn) => set({ captureFrameImageData: fn }),
       setCaptureCanvasSource: (fn) => set({ captureCanvasSource: fn }),
       toggleUseProxy: () => set((state) => ({ useProxy: !state.useProxy })),
-      setPreviewQuality: () => set((state) => (
-        state.previewQuality === 1 ? state : { previewQuality: 1 }
-      )),
+      setPreviewQuality: (quality) =>
+        set((state) => {
+          const nextQuality = normalizePreviewQuality(quality);
+          if (state.previewQuality === nextQuality) return state;
+          return { previewQuality: nextQuality };
+        }),
     }),
     {
       name: 'playback-storage',
